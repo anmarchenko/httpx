@@ -8,8 +8,8 @@ on:
     branches: ["master", "version-*"]
 
 jobs:
-  tests:
-    name: "Python ${{ matrix.python-version }}"
+  dd_plan:
+    name: "Plan Python ${{ matrix.python-version }}"
     runs-on: "ubuntu-latest"
 
     strategy:
@@ -22,13 +22,139 @@ jobs:
         with:
           python-version: "${{ matrix.python-version }}"
           allow-prereleases: true
+          cache: "pip"
+          cache-dependency-path: "requirements.txt"
       - name: "Install dependencies"
         run: "scripts/install"
       - name: "Run linting checks"
         run: "scripts/check"
       - name: "Build package & docs"
         run: "scripts/build"
+      - name: "Configure Datadog Test Optimization"
+        uses: "datadog/test-visibility-github-action@v3"
+        with:
+          languages: "python"
+          api_key: "${{ secrets.DD_API_KEY }}"
+          site: "datadoghq.com"
+      - name: "Install ddtest"
+        run: |
+          mkdir -p bin
+          curl -fsSL https://github.com/DataDog/ddtest/releases/latest/download/ddtest-linux-amd64 -o bin/ddtest
+          chmod +x bin/ddtest
+      - name: "Plan test execution"
+        id: "dd_plan"
+        run: |
+          rm -rf .testoptimization
+          bin/ddtest plan --platform python --framework pytest --command "coverage run -m pytest" --min-parallelism 1 --max-parallelism 2
+      - name: "Record test matrix"
+        env:
+          DDTEST_MATRIX: "${{ steps.dd_plan.outputs.matrix }}"
+        run: |
+          jq -n \
+            --arg python_version "${{ matrix.python-version }}" \
+            --argjson matrix "$DDTEST_MATRIX" \
+            '{python_version: $python_version, matrix: $matrix}' \
+            > ddtest-matrix.json
+      - name: "Upload test plan"
+        uses: "actions/upload-artifact@v4"
+        with:
+          name: "ddtest-plan-${{ matrix.python-version }}"
+          path: |
+            .testoptimization/
+            bin/ddtest
+            ddtest-matrix.json
+          include-hidden-files: true
+          if-no-files-found: error
+
+  dd_matrix:
+    name: "Assemble test matrix"
+    needs: "dd_plan"
+    runs-on: "ubuntu-latest"
+    outputs:
+      matrix: "${{ steps.matrix.outputs.matrix }}"
+
+    steps:
+      - name: "Download test plans"
+        uses: "actions/download-artifact@v4"
+        with:
+          pattern: "ddtest-plan-*"
+          path: "plans"
+      - name: "Assemble test matrix"
+        id: "matrix"
+        run: |
+          matrix="$(jq -cs '{include: [ .[] | .python_version as $python_version | .matrix.include[] | . + {"python-version": $python_version} ]}' plans/*/ddtest-matrix.json)"
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+
+  tests:
+    name: "Python ${{ matrix.python-version }} / node ${{ matrix.ci_node_index }}"
+    needs: "dd_matrix"
+    runs-on: "ubuntu-latest"
+
+    strategy:
+      fail-fast: false
+      matrix: "${{ fromJSON(needs.dd_matrix.outputs.matrix) }}"
+
+    steps:
+      - uses: "actions/checkout@v4"
+      - uses: "actions/setup-python@v6"
+        with:
+          python-version: "${{ matrix.python-version }}"
+          allow-prereleases: true
+          cache: "pip"
+          cache-dependency-path: "requirements.txt"
+      - name: "Install dependencies"
+        run: "scripts/install"
+      - name: "Configure Datadog Test Optimization"
+        uses: "datadog/test-visibility-github-action@v3"
+        with:
+          languages: "python"
+          api_key: "${{ secrets.DD_API_KEY }}"
+          site: "datadoghq.com"
+      - name: "Download test plan"
+        uses: "actions/download-artifact@v4"
+        with:
+          name: "ddtest-plan-${{ matrix.python-version }}"
+          path: "."
       - name: "Run tests"
-        run: "scripts/test"
+        env:
+          COVERAGE_FILE: ".coverage.${{ matrix.python-version }}.${{ matrix.ci_node_index }}"
+        run: |
+          test -f .testoptimization/manifest.txt
+          chmod +x bin/ddtest
+          bin/ddtest run --platform python --framework pytest --command "coverage run -m pytest" --ci-node "${{ matrix.ci_node_index }}"
+      - name: "Upload coverage data"
+        uses: "actions/upload-artifact@v4"
+        with:
+          name: "coverage-${{ matrix.python-version }}-${{ matrix.ci_node_index }}"
+          path: ".coverage.${{ matrix.python-version }}.${{ matrix.ci_node_index }}"
+          if-no-files-found: error
+
+  coverage:
+    name: "Coverage Python ${{ matrix.python-version }}"
+    needs: "tests"
+    runs-on: "ubuntu-latest"
+
+    strategy:
+      matrix:
+        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13"]
+
+    steps:
+      - uses: "actions/checkout@v4"
+      - uses: "actions/setup-python@v6"
+        with:
+          python-version: "${{ matrix.python-version }}"
+          allow-prereleases: true
+          cache: "pip"
+          cache-dependency-path: "requirements.txt"
+      - name: "Install dependencies"
+        run: "scripts/install"
+      - name: "Download coverage data"
+        uses: "actions/download-artifact@v4"
+        with:
+          pattern: "coverage-${{ matrix.python-version }}-*"
+          path: "."
+          merge-multiple: true
+      - name: "Combine coverage data"
+        run: "coverage combine"
       - name: "Enforce coverage"
         run: "scripts/coverage"
