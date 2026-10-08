@@ -1,0 +1,214 @@
+---
+name: HTTPX installer PR29 QA
+
+on:
+  push:
+    branches: ["anmarchenko/httpx-installer-pr29-qa-20261008"]
+  workflow_dispatch:
+
+jobs:
+  dd_plan:
+    name: "Plan Python ${{ matrix.python-version }}"
+    runs-on: "ubuntu-latest"
+
+    strategy:
+      matrix:
+        python-version: ["3.9"]
+
+    steps:
+      - uses: "actions/checkout@v4"
+      - uses: "actions/setup-python@v6"
+        with:
+          python-version: "${{ matrix.python-version }}"
+          allow-prereleases: true
+          cache: "pip"
+          cache-dependency-path: "requirements.txt"
+      - name: "Install dependencies"
+        run: "scripts/install"
+      - name: "Run linting checks"
+        run: "scripts/check"
+      - name: "Build package & docs"
+        run: "scripts/build"
+      - name: "Configure Datadog Test Optimization"
+        uses: "./.github/qa-pr29"
+        with:
+          languages: "python"
+          api_key: ""
+          site: "datadoghq.com"
+      - name: "Verify HTTPX coverage dependency is preserved"
+        run: |
+          python -c 'from importlib.metadata import version; assert version("coverage") == "7.10.6"; assert version("ddtrace") == "4.15.2"; print("coverage", version("coverage"), "ddtrace", version("ddtrace"))'
+      - name: "Install ddtest"
+        run: |
+          mkdir -p bin
+          curl -fsSL https://github.com/DataDog/ddtest/releases/download/v1.11.0/ddtest-linux-amd64 -o bin/ddtest
+          chmod +x bin/ddtest
+      - name: "Plan test execution"
+        id: "dd_plan"
+        run: |
+          rm -rf .testoptimization
+          bin/ddtest plan --platform python --framework pytest --command "coverage run -m pytest" --min-parallelism 1 --max-parallelism 2
+      - name: "Record test matrix"
+        env:
+          DDTEST_MATRIX: "${{ steps.dd_plan.outputs.matrix }}"
+        run: |
+          jq -n \
+            --arg python_version "${{ matrix.python-version }}" \
+            --argjson matrix "$DDTEST_MATRIX" \
+            '{python_version: $python_version, matrix: $matrix}' \
+            > ddtest-matrix.json
+      - name: "Upload test plan"
+        uses: "actions/upload-artifact@v4"
+        with:
+          name: "ddtest-plan-${{ matrix.python-version }}"
+          path: |
+            .testoptimization/
+            bin/ddtest
+            ddtest-matrix.json
+          include-hidden-files: true
+          if-no-files-found: error
+
+  dd_matrix:
+    name: "Assemble test matrix"
+    needs: "dd_plan"
+    runs-on: "ubuntu-latest"
+    outputs:
+      matrix: "${{ steps.matrix.outputs.matrix }}"
+
+    steps:
+      - name: "Download test plans"
+        uses: "actions/download-artifact@v4"
+        with:
+          pattern: "ddtest-plan-*"
+          path: "plans"
+      - name: "Assemble test matrix"
+        id: "matrix"
+        run: |
+          matrix="$(jq -cs '{include: [ .[] | .python_version as $python_version | .matrix.include[] | . + {"python-version": $python_version} ]}' plans/*/ddtest-matrix.json)"
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+
+  tests:
+    name: "Python ${{ matrix.python-version }} / node ${{ matrix.ci_node_index }}"
+    needs: "dd_matrix"
+    runs-on: "ubuntu-latest"
+
+    strategy:
+      fail-fast: false
+      matrix: "${{ fromJSON(needs.dd_matrix.outputs.matrix) }}"
+
+    steps:
+      - uses: "actions/checkout@v4"
+      - uses: "actions/setup-python@v6"
+        with:
+          python-version: "${{ matrix.python-version }}"
+          allow-prereleases: true
+          cache: "pip"
+          cache-dependency-path: "requirements.txt"
+      - name: "Install dependencies"
+        run: "scripts/install"
+      - name: "Configure Datadog Test Optimization"
+        uses: "./.github/qa-pr29"
+        with:
+          languages: "python"
+          api_key: ""
+          site: "datadoghq.com"
+      - name: "Download test plan"
+        uses: "actions/download-artifact@v4"
+        with:
+          name: "ddtest-plan-${{ matrix.python-version }}"
+          path: "."
+      - name: "Run tests"
+        env:
+          COVERAGE_FILE: ".coverage.${{ matrix.python-version }}.${{ matrix.ci_node_index }}"
+        run: |
+          export PYTEST_ADDOPTS="$PYTEST_ADDOPTS --junitxml=qa-node-${{ matrix.ci_node_index }}.xml"
+          python -c 'from importlib.metadata import version; assert version("coverage") == "7.10.6"; print("coverage", version("coverage"), "ddtrace", version("ddtrace"))'
+          test -f .testoptimization/manifest.txt
+          chmod +x bin/ddtest
+          bin/ddtest run --platform python --framework pytest --command "coverage run -m pytest" --ci-node "${{ matrix.ci_node_index }}"
+      - name: "Upload coverage data"
+        uses: "actions/upload-artifact@v4"
+        with:
+          name: "coverage-${{ matrix.python-version }}-${{ matrix.ci_node_index }}"
+          path: ".coverage.${{ matrix.python-version }}.${{ matrix.ci_node_index }}"
+          if-no-files-found: error
+
+      - name: "Preserve diagnostic evidence even on existing failures"
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qa-node-${{ matrix.ci_node_index }}
+          path: |
+            qa-node-*.xml
+            .coverage.*
+            .testoptimization/
+          include-hidden-files: true
+          if-no-files-found: warn
+
+  coverage:
+    name: "Coverage Python ${{ matrix.python-version }}"
+    needs: "tests"
+    runs-on: "ubuntu-latest"
+
+    strategy:
+      matrix:
+        python-version: ["3.9"]
+
+    steps:
+      - uses: "actions/checkout@v4"
+      - uses: "actions/setup-python@v6"
+        with:
+          python-version: "${{ matrix.python-version }}"
+          allow-prereleases: true
+          cache: "pip"
+          cache-dependency-path: "requirements.txt"
+      - name: "Install dependencies"
+        run: "scripts/install"
+      - name: "Download coverage data"
+        uses: "actions/download-artifact@v4"
+        with:
+          pattern: "coverage-${{ matrix.python-version }}-*"
+          path: "."
+          merge-multiple: true
+      - name: "Combine coverage data"
+        run: "coverage combine"
+      - name: "Enforce coverage"
+        run: "scripts/coverage"
+
+  released_control:
+    name: Released installer control / Python 3.9
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.9"
+          cache: pip
+          cache-dependency-path: requirements.txt
+      - run: scripts/install
+      - name: Baseline HTTPX suite before instrumentation
+        id: baseline
+        continue-on-error: true
+        run: scripts/test --junitxml=qa-baseline.xml
+      - name: Released action installer
+        id: released
+        continue-on-error: true
+        uses: ./.github/qa-control
+        with:
+          languages: python
+          api_key: ""
+      - name: Verify original installation failure reproduced
+        env:
+          INSTALL_OUTCOME: ${{ steps.released.outcome }}
+          BASELINE_OUTCOME: ${{ steps.baseline.outcome }}
+        run: |
+          echo "Baseline suite: $BASELINE_OUTCOME"
+          echo "Released installer: $INSTALL_OUTCOME"
+          test "$INSTALL_OUTCOME" = failure
+      - name: Preserve baseline result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qa-baseline
+          path: qa-baseline.xml
+          if-no-files-found: warn
