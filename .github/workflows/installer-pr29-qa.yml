@@ -38,6 +38,18 @@ jobs:
       - name: "Verify HTTPX coverage dependency is preserved"
         run: |
           python -c 'from importlib.metadata import version; assert version("coverage") == "7.10.6"; assert version("ddtrace") == "4.15.2"; print("coverage", version("coverage"), "ddtrace", version("ddtrace"))'
+      - name: "Full HTTPX suite with PR installer"
+        continue-on-error: true
+        run: scripts/test --junitxml=qa-after-installer.xml
+      - name: "Full HTTPX coverage with PR installer"
+        run: scripts/coverage
+      - name: "Save full-suite evidence"
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qa-full-suite
+          path: qa-after-installer.xml
+          if-no-files-found: error
       - name: "Install ddtest"
         run: |
           mkdir -p bin
@@ -47,7 +59,7 @@ jobs:
         id: "dd_plan"
         run: |
           rm -rf .testoptimization
-          bin/ddtest plan --platform python --framework pytest --command "coverage run -m pytest" --min-parallelism 1 --max-parallelism 2
+          bin/ddtest plan --tests-location "tests/**/test_*.py" --platform python --framework pytest --command "coverage run -m pytest" --min-parallelism 1 --max-parallelism 2
       - name: "Record test matrix"
         env:
           DDTEST_MATRIX: "${{ steps.dd_plan.outputs.matrix }}"
@@ -127,10 +139,12 @@ jobs:
           chmod +x bin/ddtest
           bin/ddtest run --platform python --framework pytest --command "coverage run -m pytest" --ci-node "${{ matrix.ci_node_index }}"
       - name: "Upload coverage data"
+        if: always()
         uses: "actions/upload-artifact@v4"
         with:
           name: "coverage-${{ matrix.python-version }}-${{ matrix.ci_node_index }}"
           path: ".coverage.${{ matrix.python-version }}.${{ matrix.ci_node_index }}"
+          include-hidden-files: true
           if-no-files-found: error
 
       - name: "Preserve diagnostic evidence even on existing failures"
@@ -146,6 +160,7 @@ jobs:
           if-no-files-found: warn
 
   coverage:
+    if: always()
     name: "Coverage Python ${{ matrix.python-version }}"
     needs: "tests"
     runs-on: "ubuntu-latest"
@@ -176,6 +191,7 @@ jobs:
         run: "scripts/coverage"
 
   released_control:
+    if: false # The original controlled failure is preserved in run 37772714617.
     name: Released installer control / Python 3.9
     runs-on: ubuntu-latest
     steps:
